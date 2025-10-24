@@ -1,0 +1,8 @@
+conda create -n PromptMoE python=3.13
+conda activate PromptMoE
+cd segment-anything; pip install -e .
+
+pip install matplotlib transformers scikit-image opencv-python timm
+pip install --upgrade diffusers[torch]
+
+
