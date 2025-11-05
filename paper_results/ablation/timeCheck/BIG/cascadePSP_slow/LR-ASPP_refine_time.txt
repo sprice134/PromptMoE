@@ -1,0 +1,3 @@
+Total refinement time: 463.2573 seconds
+Number of refinements: 90
+Average per image: 5.1473 seconds
