@@ -223,10 +223,10 @@ if __name__ == "__main__":
 
     '''
     python plotAllExpertsDistribution.py \
-        /home/sprice/PromptMoE/paper_results/ablation/timeCheck/BIG \
-        /home/sprice/PromptMoE/paper_results/ablation/timeCheck/DAVIS585 \
-        /home/sprice/PromptMoE/paper_results/ablation/timeCheck/ECSSD \
-        /home/sprice/PromptMoE/paper_results/ablation/timeCheck/MSRA-B \
-        /home/sprice/PromptMoE/paper_results/ablation/timeCheck/VOC \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/timeCheck/BIG \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/timeCheck/DAVIS585 \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/timeCheck/ECSSD \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/timeCheck/MSRA-B \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/timeCheck/VOC \
         --ours_name PromptMoE
     '''

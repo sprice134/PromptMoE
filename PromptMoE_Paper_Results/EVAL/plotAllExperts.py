@@ -837,10 +837,10 @@ if __name__ == "__main__":
  
     '''
     python plotAllExperts.py \
-        /home/sprice/PromptMoE/paper_results/ablation/experts/BIG/ \
-        /home/sprice/PromptMoE/paper_results/ablation/experts/DAVIS585/ \
-        /home/sprice/PromptMoE/paper_results/ablation/experts/ECSSD/ \
-        /home/sprice/PromptMoE/paper_results/ablation/experts/VOC/ \
-        /home/sprice/PromptMoE/paper_results/ablation/experts/MSRA-B/ \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/experts/BIG/ \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/experts/DAVIS585/ \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/experts/ECSSD/ \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/experts/VOC/ \
+        /home/sprice/PromptMoE/PromptMoE_Paper_Results/ablation/experts/MSRA-B/ \
         --ours_name E13_Router-P
     '''
