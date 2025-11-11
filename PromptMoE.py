@@ -803,11 +803,42 @@ def compute_sam_mask_features(mask_bin: np.ndarray, full_embed: torch.Tensor) ->
 
 
 @torch.no_grad()
-def compute_sam_embeddings(predictor: SamPredictor, image_rgb: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
-    predictor.set_image(image_rgb)  # sets internal state
-    full_embed = predictor.get_image_embedding()          # (1, C, H', W')
-    pooled_embed = full_embed.mean(dim=(2, 3)).squeeze(0) # (C,)
+def compute_sam_embeddings(predictor: SamPredictor) -> Tuple[torch.Tensor, torch.Tensor]:
+    full = predictor.get_image_embedding()
+    if isinstance(full, (tuple, list)):
+        # SAM-HQ style: (image_embeddings, interm_embeddings)
+        full_embed = full[0]
+    else:
+        full_embed = full
+    pooled_embed = full_embed.mean(dim=(2, 3)).squeeze(0)  # (C,)
     return full_embed, pooled_embed
+
+def compute_hq_image_embeddings(
+    sam_model,
+    image_rgb: np.ndarray,
+    resize_tf: ResizeLongestSide,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    For SAM-HQ: run image_encoder once and return
+    (image_embeddings, interm_embeddings_early) exactly like in your first snippet.
+    """
+    image_t = prepare_image_for_sam(image_rgb, resize_tf, device)  # 3xH'xW'
+    imgs = [image_t]
+    # Same pattern as your sam_refiner example: sam.preprocess(x) on 3xHxW tensors
+    input_images = torch.stack([sam_model.preprocess(x) for x in imgs], dim=0)
+    out = sam_model.image_encoder(input_images)
+
+    if not isinstance(out, (tuple, list)) or len(out) != 2:
+        raise RuntimeError(
+            "use_samhq=True but sam_model.image_encoder did not return (image_embeddings, interm_embeddings). "
+            "Are you sure you're using a SAM-HQ model?"
+        )
+
+    image_embeddings, interm_embeddings = out
+    interm_embeddings = interm_embeddings[0]  # early layer, just like your first code
+    return image_embeddings, interm_embeddings
+
 
 def compute_cheap_mask_features(mask_bin: np.ndarray, image_rgb: np.ndarray) -> np.ndarray:
     m = (mask_bin > 127).astype(np.uint8)
@@ -866,6 +897,7 @@ def sam_refiner_router(
     coarse_mask_255: np.ndarray,     # 0/255
     predictor: SamPredictor,         # single shared predictor
     full_img_embed: torch.Tensor,    # (1,C,H',W') for forward_with_image_embeddings
+    interm_embed: Optional[torch.Tensor],
     selected_weights: Dict[str, float],
     sam_model,                       # SAM (only for .forward_with_image_embeddings)
     device: torch.device,
@@ -880,24 +912,54 @@ def sam_refiner_router(
     depth_cfg: Dict[str, object],
     mask_gen: SamAutomaticMaskGenerator,
     log_points: bool = False,
+    use_samhq: bool = False,
 ) -> np.ndarray:
     """
     Refines a coarse mask using SAM; DOES NOT call the router (weights are provided).
     Saliency is computed once up-front and reused across iterations by default.
     """
     # Prepare tensors once
-    img_t_cpu = load_image(image_path)                   # torch 3xHxW [0..255]
+    if image_path is not None:
+        # File-based path (dataset / process_model case)
+        img_t_cpu = load_image(image_path)  # torch 3xHxW [0..255]
+        raw_path_for_depth = image_path
+    else:
+        # In-memory image (arrays API)
+        if isinstance(image_rgb, np.ndarray):
+            img_t_cpu = torch.from_numpy(image_rgb.astype("float32")).permute(2, 0, 1)
+        else:
+            # If someone passes a torch tensor directly
+            img_t_cpu = image_rgb
+        raw_path_for_depth = None
+
     image_t_for_sam = prepare_image_for_sam(image_rgb, resize_tf, device)
     masks_t = torch.as_tensor(coarse_mask_255[None, ...] > 0, dtype=torch.uint8, device=device)
 
+
     # One-time saliency for the initial coarse mask (no recompute across iters)
     coarse01 = torch.from_numpy((coarse_mask_255 > 0).astype(np.uint8))
+
+    # If we have a depth model (Marigold) but no file path, skip 'Gd' safely
+    sal_selected = dict(selected_weights)
+    if raw_path_for_depth is None and mg is not None and "Gd" in sal_selected:
+        print("Warning: image_path is None; skipping depth expert 'Gd' for this image.")
+        del sal_selected["Gd"]
+
     sal_map, _ = build_saliency_for_mask(
-        raw_path=image_path, img_rgb_t=img_t_cpu, fg01=coarse01,
-        selected=selected_weights, resize_tf=resize_tf, mg=mg, device=device,
-        beta=beta, point_map=point_map, depth_cfg=depth_cfg,
-        predictor=predictor, mask_gen=mask_gen
+        raw_path=raw_path_for_depth,
+        img_rgb_t=img_t_cpu,
+        fg01=coarse01,
+        selected=sal_selected,
+        resize_tf=resize_tf,
+        mg=mg,
+        device=device,
+        beta=beta,
+        point_map=point_map,
+        depth_cfg=depth_cfg,
+        predictor=predictor,
+        mask_gen=mask_gen,
     )
+
 
     sam_masks = None
     iters = int(depth_cfg.get("iters", 5))
@@ -915,11 +977,171 @@ def sam_refiner_router(
                 triplets = [(int(x), int(y), int(l)) for (x, y), l in zip(pts, labs)]
                 print(f"[Iter {it}] mask {bi} points (x,y,label): {triplets}")
 
-        out = sam_model.forward_with_image_embeddings(full_img_embed, [inp], multimask_output=True)[0]
+        if use_samhq and interm_embed is not None:
+            # SAM-HQ style: forward_with_image_embeddings(image_embeddings, interm_embeddings, inputs, ...)
+            out = sam_model.forward_with_image_embeddings(
+                full_img_embed, interm_embed, [inp], multimask_output=True
+            )[0]
+        else:
+            # Vanilla SAM
+            out = sam_model.forward_with_image_embeddings(
+                full_img_embed, [inp], multimask_output=True
+            )[0]
+
         best = torch.argmax(out['iou_predictions'], dim=-1)
         sam_masks = torch.stack([m[idx] for m, idx in zip(out['masks'], best)], 0)
 
     return (sam_masks > 0).detach().cpu().numpy().astype(np.uint8)
+
+@torch.no_grad()
+def refine_masks_from_arrays(
+    images_rgb: List[np.ndarray],
+    coarse_masks_255: List[np.ndarray],
+    sam_model,
+    predictor: SamPredictor,
+    device: torch.device,
+    router: Optional[PairRouter],
+    router_cfg: Optional[dict],
+    mg: Optional[MarigoldRunner],
+    beta: float,
+    point_map: str,
+    k_points: int,
+    suppression_frac: float,
+    iters: int,
+    use_point: bool, use_box: bool, use_mask: bool, add_neg: bool,
+    margin: float, gamma: float, strength: int,
+    router_topk: int,
+    depth_cfg: Dict[str, object],
+    resize_tf: ResizeLongestSide,
+    mask_gen: SamAutomaticMaskGenerator,
+    manual_weights_str: Optional[str] = None,
+    log_points: bool = False,
+    light_mode: bool = False,
+    use_samhq: bool = False,
+    save_dir: Optional[str] = None,
+    image_ids: Optional[List[str]] = None,
+) -> List[np.ndarray]:
+    """
+    In-memory batch API:
+      - images_rgb:      list of RGB images as numpy arrays (H, W, 3) in [0,255]
+      - coarse_masks_255: list of masks as numpy arrays (H, W); 0/1 or 0/255 are both fine
+      - returns:         list of refined masks as numpy arrays (H, W), values in {0,255}
+
+    No directory walking, no ground-truth evaluation, no CSVs.
+    Optionally saves refined masks to `save_dir` (one PNG per image).
+    """
+
+    if len(images_rgb) != len(coarse_masks_255):
+        raise ValueError(
+            f"images_rgb and coarse_masks_255 must have the same length "
+            f"({len(images_rgb)} vs {len(coarse_masks_255)})"
+        )
+
+    n = len(images_rgb)
+    if image_ids is None:
+        image_ids = [f"img_{i:05d}" for i in range(n)]
+    elif len(image_ids) != n:
+        raise ValueError(
+            f"image_ids must be None or have the same length as images_rgb "
+            f"({len(image_ids)} vs {n})"
+        )
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+
+    if manual_weights_str is None and not (router and router_cfg):
+        raise ValueError("Provide router+router_cfg or use manual_weights_str to bypass the router.")
+
+    refined_masks: List[np.ndarray] = []
+
+    for idx, (img_rgb, pm_raw, img_id) in enumerate(
+        tqdm(zip(images_rgb, coarse_masks_255, image_ids), total=n, desc="Refining masks")
+    ):
+        # Ensure mask is binary 0/255
+        pm8 = (pm_raw > 0).astype(np.uint8) * 255
+
+        # Basic sanity checks on the image
+        if not isinstance(img_rgb, np.ndarray):
+            raise TypeError(f"images_rgb[{idx}] must be a numpy array (got {type(img_rgb)}).")
+        if img_rgb.ndim != 3 or img_rgb.shape[2] != 3:
+            raise ValueError(f"images_rgb[{idx}] must have shape HxWx3 (got {img_rgb.shape}).")
+
+        # Set SAM predictor for this image (prompt expert & mask generator rely on this)
+        predictor.set_image(img_rgb)
+
+        # Compute image embeddings
+        if use_samhq:
+            # SAM-HQ path: image_encoder returns (image_embeddings, interm_embeddings)
+            img_emb_full, img_interm = compute_hq_image_embeddings(
+                sam_model, img_rgb, resize_tf, device
+            )
+            img_emb_pooled = img_emb_full.mean(dim=(2, 3)).squeeze(0)
+        else:
+            # Vanilla SAM path
+            img_emb_full, img_emb_pooled = compute_sam_embeddings(predictor)
+            img_interm = None
+
+        # Router / expert weights
+        if manual_weights_str:
+            selected_weights = parse_expert_weights_from_str(manual_weights_str) or {}
+        else:
+            cheap_feats = compute_cheap_mask_features(pm8, img_rgb)  # (6,)
+            sam_feats   = compute_sam_mask_features(pm8, img_emb_full)  # (C, usually 256)
+            pooled_np   = img_emb_pooled.detach().cpu().numpy()  # (C,)
+
+            g = build_context_g(
+                pooled_embed_np=pooled_np,
+                sam_mask_feats_np=sam_feats,
+                cheap_mask_feats_np=cheap_feats,
+                router_cfg=router_cfg,
+                device=device,
+            )
+            selected_weights = get_weights_from_pair_router(
+                router, g, topk=router_topk, light_mode=light_mode
+            )
+
+        # Per-image depth config (same pattern as process_model)
+        depth_cfg_loc = dict(depth_cfg)
+        depth_cfg_loc["iters"] = iters
+
+        # Run the refiner; note image_path=None (we're in pure in-memory mode)
+        refined01 = sam_refiner_router(
+            image_path=None,
+            image_rgb=img_rgb,
+            coarse_mask_255=pm8,
+            predictor=predictor,
+            full_img_embed=img_emb_full,
+            interm_embed=img_interm,
+            selected_weights=selected_weights,
+            sam_model=sam_model,
+            device=device,
+            resize_tf=resize_tf,
+            mg=mg,
+            beta=beta,
+            point_map=point_map,
+            k_points=k_points,
+            suppression_frac=suppression_frac,
+            use_point=use_point,
+            use_box=use_box,
+            use_mask=use_mask,
+            add_neg=add_neg,
+            margin=margin,
+            gamma=gamma,
+            strength=strength,
+            depth_cfg=depth_cfg_loc,
+            mask_gen=mask_gen,
+            log_points=log_points,
+            use_samhq=use_samhq,
+        )[0]  # shape: (H, W), values {0,1}
+
+        refined255 = (refined01.astype(np.uint8) * 255)
+        refined_masks.append(refined255)
+
+        if save_dir is not None:
+            out_path = os.path.join(save_dir, f"{img_id}_refined.png")
+            cv2.imwrite(out_path, refined255)
+
+    return refined_masks
 
 
 # ============================================================================
@@ -1012,7 +1234,8 @@ def process_model(
     mask_gen: SamAutomaticMaskGenerator,
     manual_weights_str: Optional[str],
     log_points: bool = False,
-    light_mode: bool = False
+    light_mode: bool = False,
+    use_samhq: bool = False,
 ):
     subdirs = sorted(d for d in os.listdir(input_root) if os.path.isdir(os.path.join(input_root, d)))
     rows = []
@@ -1038,14 +1261,26 @@ def process_model(
         u_iou = compute_iou(pm8, gt8)
         u_biou = compute_boundary_iou(pm8, gt8)
 
-        # Load image ONCE and set predictor ONCE for this image
+        # Load image ONCE for this subdir
         bgr = cv2.imread(raw_p, cv2.IMREAD_COLOR)
-        if bgr is None: 
+        if bgr is None:
             continue
         img_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-        # Compute SAM embeddings ON DEMAND (no cache) — former cache removed
-        img_emb_full, img_emb_pooled = compute_sam_embeddings(predictor, img_rgb)
+        # Tell the predictor about this image (used by prompt expert + mask generator)
+        predictor.set_image(img_rgb)
+
+        # Compute the image embeddings for router/refiner
+        if use_samhq:
+            # HQ path: image_encoder returns (image_embeddings, interm_embeddings)
+            img_emb_full, img_interm = compute_hq_image_embeddings(
+                sam_model, img_rgb, resize_tf, device
+            )
+            img_emb_pooled = img_emb_full.mean(dim=(2, 3)).squeeze(0)
+        else:
+            # Vanilla SAM path
+            img_emb_full, img_emb_pooled = compute_sam_embeddings(predictor)
+            img_interm = None
 
         # Build router context g ONCE per image (pooled token + cheap mask feats)
         if manual_weights_str:
@@ -1077,6 +1312,7 @@ def process_model(
             coarse_mask_255=pm8,
             predictor=predictor,
             full_img_embed=img_emb_full,
+            interm_embed=img_interm,   # <- NEW
             selected_weights=selected_weights,
             sam_model=sam_model,
             device=device,
@@ -1088,7 +1324,9 @@ def process_model(
             depth_cfg=depth_cfg_loc,
             mask_gen=mask_gen,
             log_points=log_points,
+            use_samhq=use_samhq,       # <- NEW
         )[0] * 255
+
 
         r_iou = compute_iou(rf8, gt8)
         r_biou = compute_boundary_iou(rf8, gt8)
@@ -1151,6 +1389,8 @@ def parse_args():
     # Debug/logging
     p.add_argument('--log_points', action='store_true', help='Print placed points (x,y,label) each iter.')
     p.add_argument('--light_mode', action='store_true', help="Enable PromptMoE-Light (6 non-learned experts only).")
+    p.add_argument('--use_samhq', action='store_true',
+                   help="Use SAM-HQ (image_encoder returns (emb, interm) and forward_with_image_embeddings takes them).")
 
     return p.parse_args()
 
@@ -1225,6 +1465,7 @@ def main():
             manual_weights_str=args.expert_weights,
             log_points=args.log_points,
             light_mode=args.light_mode,
+            use_samhq=args.use_samhq,  
         )
 
 if __name__ == "__main__":
